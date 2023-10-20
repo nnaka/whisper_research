@@ -5,8 +5,8 @@
 #SBATCH --time=2:00:00
 #SBATCH --mem-per-cpu=60GB
 #SBATCH --gres=gpu
-#SBATCH --job-name=whisper-research
-#SBATCH --output=whisper-research.out
+# #SBATCH --job-name=whisper-research
+# #SBATCH --output=whisper-research.out
 
 module purge
 
