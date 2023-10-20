@@ -1,0 +1,6 @@
+datasets
+evaluate
+openai-whisper
+torch
+torchvision
+transformers[torch]
