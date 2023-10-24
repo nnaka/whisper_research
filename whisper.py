@@ -1,22 +1,36 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Usage:
-    $ spark-submit --deploy-mode client _.py
-"""
+
 from argparse import ArgumentParser
 import csv
 from enum import Enum
 import functools
 import os
 import sys
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Generator, List, Optional, Tuple, Union
+
+# Must be called before the import of transformers etc to properly set the .cache dir
+def setup_env(path: str) -> None:
+    """Modifying where the .cache directory is getting stored"""
+    os.environ["HF_HOME"] = path
+    os.environ["TORCH_HOME"] = path
+    os.environ["TRANSFORMERS_CACHE"] = path
+    print(
+        f"Environment variables set TORCH_HOME = {os.environ['TORCH_HOME']}; HF_HOME={os.environ['HF_HOME']}; TRANSFORMERS_CACHE={os.environ['TRANSFORMERS_CACHE']}"
+    )
+
+
+setup_env("/scratch/nn1331/entailment/.cache")
 
 from datasets import Dataset, load_dataset
 import evaluate
+import nltk
+from nltk.tokenize import sent_tokenize
 import numpy as np
+import torch
 from transformers import (
     AutoModelForSequenceClassification,
+    AutoModelForSeq2SeqLM,
     AutoTokenizer,
     DataCollatorWithPadding,
     pipeline,
@@ -26,113 +40,9 @@ from transformers import (
 )
 
 
-class EntailmentCategory(Enum):
-    ENTAILMENT = 0
-    NEUTRAL = 1
-    CONTRADICTION = 2
-
-
-def create_preprocess_function(tokenizer):
-    # TODO: review what's the best way to include premise and the hypothesis
-    def preprocess_function(examples):
-        print(examples)
-        entries_to_remove: List[str] = [
-            "promptID",
-            "pairID",
-            "premise_binary_parse",
-            "premise_parse",
-            "hypothesis_binary_parse",
-            "hypothesis_parse",
-            "genre",
-        ]
-        for entry in entries_to_remove:
-            examples.pop(entry, None)
-
-        print(examples["premise"])
-        # Truncate context
-        examples["premise"] = [
-            tokenizer(example, truncation=True) for example in examples["premise"]
-        ]
-        print(examples["premise"])
-        examples["hypothesis"] = [
-            tokenizer(example, truncation=True) for example in examples["hypothesis"]
-        ]
-        return examples
-
-    return preprocess_function
-
-
-def compute_metrics(eval_pred):
-    predictions, labels = eval_pred
-    predictions = np.argmax(predictions, axis=1)
-    return accuracy.compute(predictions=predictions, references=labels)
-
-
 def main(is_full: bool, is_final: bool) -> None:
     """Main routine"""
     run_zero_shot()
-
-
-def train_model() -> None:
-    print("Running entailment training")
-
-    # Preprocess helpers
-    tokenizer: AutoTokenizer = AutoTokenizer.from_pretrained("roberta-base")
-    data_collator: DataCollatorWithPadding = DataCollatorWithPadding(
-        tokenizer=tokenizer
-    )
-
-    # Dataset recommended by Will Merrill
-    dataset: Dataset = load_dataset("multi_nli")
-
-    print(dataset)
-    print(dataset.keys())
-
-    # Preprocess data
-    preprocess_function = create_preprocess_function(tokenizer)
-    tokenized_dataset = dataset.map(preprocess_function, batched=True)
-
-    print(tokenized_dataset)
-
-    accuracy = evaluate.load("accuracy")
-
-    id2label: Dict[int, str] = {i.value: i.name for i in EntailmentCategory}
-    label2id: Dict[str, int] = {i.name: i.value for i in EntailmentCategory}
-
-    model: AutoModelForSequenceClassification = (
-        AutoModelForSequenceClassification.from_pretrained(
-            "roberta-large-mnli",
-            num_labels=len(id2label.keys()),
-            id2label=id2label,
-            label2id=label2id,
-        )
-    )
-
-    training_args: TrainingArguments = TrainingArguments(
-        output_dir="entailment_classifier_model",
-        learning_rate=2e-5,
-        per_device_train_batch_size=16,
-        per_device_eval_batch_size=16,
-        num_train_epochs=2,
-        weight_decay=0.01,
-        evaluation_strategy="epoch",
-        save_strategy="epoch",
-        load_best_model_at_end=True,
-        push_to_hub=True,
-    )
-
-    trainer: Trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=tokenized_dataset["train"],
-        eval_dataset=tokenized_dataset["validation_matched"],
-        tokenizer=tokenizer,
-        data_collator=data_collator,
-        compute_metrics=compute_metrics,
-    )
-
-    trainer.train()
-    trainer.push_to_hub()
 
 
 def run_zero_shot() -> None:
@@ -170,92 +80,6 @@ def get_last_sentences(text: str, max_chars: int) -> str:
     return ". ".join(selected_sentences)
 
 
-def open_web_text(classifier: Pipeline) -> None:
-    # Dataset source: https://huggingface.co/datasets/openwebtext
-    dataset: Dataset = load_dataset("openwebtext")
-    # dataset: Dataset = load_dataset(
-    #    "openwebtext", download_mode="force_redownload", split="train"
-    # )
-
-    # Get entailment examples
-    results: Dict[EntailmentCategory, List[str]] = {
-        "CONTRADICTION": [],
-        "ENTAILMENT": [],
-        "NEUTRAL": [],
-    }
-    label: str = ""
-    score: float = 0.0
-
-    print(f"{len(dataset['train'])} training examples")
-    # print(f'{dataset["train"][0]}')
-
-    # Write results in csv
-    csv_writer = csv.writer(sys.stdout)
-
-    for data in dataset["train"]:
-        print(data)
-        # Truncate sentences (context) to under 512 characters for roberta limit
-        truncated_sentences: str = (
-            get_last_sentences(data["text"], 100)
-            if len(data["text"]) >= 100
-            else data["text"]
-        )
-        try:
-            res: Dict[str, Union[str, float]] = classifier(truncated_sentences)[0]
-        except Exception as e:
-            print("=======GETTING HERE=====")
-            print(truncated_sentences)
-            print(classifier(truncated_sentences))
-            print("=======GETTING HERE=====")
-        label: str = res["label"]
-        score: float = res["score"]
-        # print(f"label: {label}; score: {score}")
-        if float(score) > 0.5:
-            results[label].append(f'{data["text"]}')
-
-            csv_writer.writerow([label, score, data["text"]])
-
-            if label == "ENTAILMENT":
-                pass
-                # print(f"Entailment: {data}")
-
-
-def mnli_test(classifier: Pipeline) -> None:
-    # Dataset recommended by Will Merrill
-    dataset: Dataset = load_dataset("multi_nli")
-
-    # Get entailment examples
-    results: Dict[EntailmentCategory, List[str]] = {
-        "CONTRADICTION": [],
-        "ENTAILMENT": [],
-        "NEUTRAL": [],
-    }
-    label: str = ""
-    score: float = 0.0
-
-    print(f"{len(dataset['train'])} training examples")
-    # print(f'{dataset["train"][0]}')
-    # Write results in csv
-    csv_writer = csv.writer(sys.stdout)
-
-    for data in dataset["train"]:
-        # print(f'{data["premise"] + data["hypothesis"]} {classifier(data["premise"] + data["hypothesis"])}')
-        res: Dict[str, Union[str, float]] = classifier(
-            data["premise"] + data["hypothesis"]
-        )[0]
-        label: str = res["label"]
-        score: float = res["score"]
-        # print(f"label: {label}; score: {score}")
-        if float(score) > 0.5:
-            results[label].append(f'{data["premise"]}, {data["hypothesis"]}')
-
-            csv_writer.writerow([label, data["premise"], data["hypothesis"]])
-
-            if label == "ENTAILMENT":
-                pass
-                # print(f"Entailment: {data}")
-
-
 if __name__ == "__main__":
     parser: ArgumentParser = ArgumentParser()
     parser.add_argument(
@@ -267,6 +91,12 @@ if __name__ == "__main__":
         action="store_true",
         help="Run on final datasets, train/test",
     )
+    parser.add_argument(
+        "--out",
+        dest="output",
+        type=str,
+        help="Output CSV file path",
+    )
 
     args = parser.parse_args()
     print(f"Using args: {args}")
@@ -276,4 +106,4 @@ if __name__ == "__main__":
 
     # Call our main routine
     # main(spark, args.is_full, args.is_final)
-    main(args.is_full, args.is_final)
+    main(args.is_full, args.is_final, args.output)

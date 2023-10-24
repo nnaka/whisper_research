@@ -1,6 +1,8 @@
 datasets
 evaluate
+moviepy
 openai-whisper
+pytube
 torch
 torchvision
 transformers[torch]
